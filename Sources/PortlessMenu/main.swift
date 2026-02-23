@@ -471,6 +471,7 @@ final class PortlessMenuModel: ObservableObject {
         process.terminationHandler = { [weak self] proc in
             Task { @MainActor in
                 let lastLine = self?.managedLogLines[pid]?.last
+                    .flatMap { self?.sanitizedDisplayLine($0) }
                 let runtime = Date().timeIntervalSince(startedAt)
                 self?.updateRunRecordForTermination(pid: pid, exitCode: proc.terminationStatus, lastLine: lastLine)
                 self?.cleanupManagedProcess(pid: pid)
@@ -808,6 +809,15 @@ final class PortlessMenuModel: ObservableObject {
     }
 
     private func refreshRunHistory() {
+        let sanitizedRecords = runRecordsByPID.mapValues { record in
+            var copy = record
+            if let line = copy.lastLogLine {
+                copy.lastLogLine = sanitizedDisplayLine(line)
+            }
+            return copy
+        }
+        runRecordsByPID = sanitizedRecords
+
         recentRuns = runRecordsByPID.values
             .sorted { $0.startedAt > $1.startedAt }
         if recentRuns.count > maxRunHistory {
@@ -906,6 +916,12 @@ final class PortlessMenuModel: ObservableObject {
             cleaned = oscRegex.stringByReplacingMatches(in: cleaned, options: [], range: range, withTemplate: "")
         }
         cleaned = cleaned.replacingOccurrences(of: "\u{001B}", with: "")
+
+        // Some tools emit orphan control fragments without ESC (e.g. "[?25h").
+        if let orphanCSIRegex = try? NSRegularExpression(pattern: #"\[(?:\??\d{1,4}(?:;\d{1,4})*)?[A-Za-z]"#) {
+            let range = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
+            cleaned = orphanCSIRegex.stringByReplacingMatches(in: cleaned, options: [], range: range, withTemplate: "")
+        }
 
         // Drop non-printable control characters while preserving tabs/spaces.
         let filteredScalars = cleaned.unicodeScalars.filter { scalar in
