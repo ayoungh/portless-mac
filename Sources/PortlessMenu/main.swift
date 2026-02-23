@@ -94,6 +94,11 @@ final class PortlessMenuModel: ObservableObject {
     @Published var recentRuns: [RunRecord] = []
     @Published var recentLaunches: [RecentLaunch] = []
     @Published var routes: [String] = []
+    @Published var proxyPort: String = ""
+    @Published var proxyUseHTTPS: Bool = false
+    @Published var proxyNoTLS: Bool = false
+    @Published var proxyCertPath: String = ""
+    @Published var proxyKeyPath: String = ""
     @Published var hasLocalPortlessDependency: Bool = false
     @Published var isPortlessInstalledGlobally: Bool = false
     @Published var isInstallingPortless: Bool = false
@@ -101,6 +106,11 @@ final class PortlessMenuModel: ObservableObject {
 
     private let recentFoldersKey = "portlessMenu.recentFolders"
     private let recentLaunchesKey = "portlessMenu.recentLaunches"
+    private let proxyPortKey = "portlessMenu.proxyPort"
+    private let proxyUseHTTPSKey = "portlessMenu.proxyUseHTTPS"
+    private let proxyNoTLSKey = "portlessMenu.proxyNoTLS"
+    private let proxyCertPathKey = "portlessMenu.proxyCertPath"
+    private let proxyKeyPathKey = "portlessMenu.proxyKeyPath"
     private let maxRecentFolders = 8
 
     private var managed: [Int32: ManagedProcess] = [:]
@@ -132,6 +142,7 @@ final class PortlessMenuModel: ObservableObject {
     init() {
         loadRecentFolders()
         loadRecentLaunches()
+        loadProxySettings()
         DispatchQueue.main.async { [weak self] in
             self?.refreshPortlessAvailability()
             self?.startMonitoring()
@@ -165,6 +176,36 @@ final class PortlessMenuModel: ObservableObject {
 
     var canRunSelectedPortlessScript: Bool {
         hasLocalPortlessDependency || isPortlessInstalledGlobally || !selectedScriptNeedsPortlessTool
+    }
+
+    var proxyStartValidationMessage: String? {
+        let cert = proxyCertPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = proxyKeyPath.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if !proxyPort.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            guard let port = Int(proxyPort.trimmingCharacters(in: .whitespacesAndNewlines)),
+                  (1...65535).contains(port) else {
+                return "Proxy port must be a number between 1 and 65535."
+            }
+        }
+
+        if cert.isEmpty != key.isEmpty {
+            return "Set both cert and key paths or leave both empty."
+        }
+
+        if !cert.isEmpty && !proxyUseHTTPS {
+            return "Enable HTTPS to use custom cert/key files."
+        }
+
+        if !cert.isEmpty && !FileManager.default.fileExists(atPath: cert) {
+            return "Cert file was not found at the provided path."
+        }
+
+        if !key.isEmpty && !FileManager.default.fileExists(atPath: key) {
+            return "Key file was not found at the provided path."
+        }
+
+        return nil
     }
 
     func ensureSelectedScriptIsVisible() {
@@ -495,11 +536,20 @@ final class PortlessMenuModel: ObservableObject {
             statusMessage = "Install Portless before starting proxy."
             return
         }
+        if let validation = proxyStartValidationMessage {
+            statusMessage = validation
+            return
+        }
+        let plan = buildProxyStartPlan()
         statusMessage = "Starting Portless proxy..."
-        runAsyncShell("portless proxy start") { [weak self] code, output in
+        runAsyncCommand(plan.arguments) { [weak self] code, output in
             guard let self else { return }
             if code == 0 {
-                self.statusMessage = "Portless proxy started."
+                if let warning = plan.warning {
+                    self.statusMessage = "Portless proxy started. \(warning)"
+                } else {
+                    self.statusMessage = "Portless proxy started."
+                }
                 self.refreshRoutes()
             } else {
                 self.statusMessage = "Proxy start failed: \(self.lastNonEmptyLine(from: output) ?? "unknown error")"
@@ -509,7 +559,7 @@ final class PortlessMenuModel: ObservableObject {
 
     func stopProxy() {
         statusMessage = "Stopping Portless proxy..."
-        runAsyncShell("portless proxy stop") { [weak self] code, output in
+        runAsyncCommand(["portless", "proxy", "stop"]) { [weak self] code, output in
             guard let self else { return }
             if code == 0 {
                 self.statusMessage = "Portless proxy stopped."
@@ -526,7 +576,7 @@ final class PortlessMenuModel: ObservableObject {
             return
         }
 
-        runAsyncShell("portless list") { [weak self] code, output in
+        runAsyncCommand(["portless", "list"]) { [weak self] code, output in
             guard let self else { return }
             if code != 0 {
                 self.routes = []
@@ -865,12 +915,69 @@ final class PortlessMenuModel: ObservableObject {
         return "npm install -g portless"
     }
 
+    private func buildProxyStartPlan() -> (arguments: [String], warning: String?) {
+        var args = ["portless", "proxy", "start"]
+        var warning: String?
+
+        let trimmedPort = proxyPort.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let port = Int(trimmedPort), (1...65535).contains(port) {
+            args.append(contentsOf: ["--port", String(port)])
+            if port < 1024 {
+                warning = "Using port \(port) may require elevated privileges."
+            }
+        }
+
+        if proxyUseHTTPS {
+            args.append("--https")
+        }
+
+        if proxyNoTLS {
+            args.append("--no-tls")
+        }
+
+        let cert = proxyCertPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = proxyKeyPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cert.isEmpty && !key.isEmpty {
+            args.append(contentsOf: ["--cert", cert, "--key", key])
+        }
+
+        return (args, warning)
+    }
+
     private func runAsyncShell(_ command: String, completion: @escaping (Int32, String) -> Void) {
         let environment = toolExecutionEnvironment()
         DispatchQueue.global(qos: .userInitiated).async {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
             process.arguments = ["-c", command]
+            process.environment = environment
+
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+
+            do {
+                try process.run()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                let output = String(decoding: data, as: UTF8.self)
+                DispatchQueue.main.async {
+                    completion(process.terminationStatus, output)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    completion(1, error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func runAsyncCommand(_ arguments: [String], completion: @escaping (Int32, String) -> Void) {
+        let environment = toolExecutionEnvironment()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = arguments
             process.environment = environment
 
             let pipe = Pipe()
@@ -1126,6 +1233,24 @@ final class PortlessMenuModel: ObservableObject {
         }
     }
 
+    private func loadProxySettings() {
+        let defaults = UserDefaults.standard
+        proxyPort = defaults.string(forKey: proxyPortKey) ?? ""
+        proxyUseHTTPS = defaults.bool(forKey: proxyUseHTTPSKey)
+        proxyNoTLS = defaults.bool(forKey: proxyNoTLSKey)
+        proxyCertPath = defaults.string(forKey: proxyCertPathKey) ?? ""
+        proxyKeyPath = defaults.string(forKey: proxyKeyPathKey) ?? ""
+    }
+
+    func saveProxySettings() {
+        let defaults = UserDefaults.standard
+        defaults.set(proxyPort.trimmingCharacters(in: .whitespacesAndNewlines), forKey: proxyPortKey)
+        defaults.set(proxyUseHTTPS, forKey: proxyUseHTTPSKey)
+        defaults.set(proxyNoTLS, forKey: proxyNoTLSKey)
+        defaults.set(proxyCertPath.trimmingCharacters(in: .whitespacesAndNewlines), forKey: proxyCertPathKey)
+        defaults.set(proxyKeyPath.trimmingCharacters(in: .whitespacesAndNewlines), forKey: proxyKeyPathKey)
+    }
+
     private func addRecentFolder(_ path: String) {
         let normalized = URL(fileURLWithPath: path).path
         recentFolders.removeAll { $0 == normalized }
@@ -1245,8 +1370,38 @@ struct ContentView: View {
                 }
 
                 sectionCard("Proxy") {
+                    TextField("Proxy port (optional, e.g. 4433)", text: $model.proxyPort)
+                        .textFieldStyle(.roundedBorder)
+                        .onChange(of: model.proxyPort) { _ in
+                            model.saveProxySettings()
+                        }
+                    Toggle("Enable HTTPS (--https)", isOn: $model.proxyUseHTTPS)
+                        .onChange(of: model.proxyUseHTTPS) { _ in
+                            model.saveProxySettings()
+                        }
+                    Toggle("Disable TLS to backend (--no-tls)", isOn: $model.proxyNoTLS)
+                        .onChange(of: model.proxyNoTLS) { _ in
+                            model.saveProxySettings()
+                        }
+                    TextField("TLS cert path (--cert)", text: $model.proxyCertPath)
+                        .textFieldStyle(.roundedBorder)
+                        .onChange(of: model.proxyCertPath) { _ in
+                            model.saveProxySettings()
+                        }
+                    TextField("TLS key path (--key)", text: $model.proxyKeyPath)
+                        .textFieldStyle(.roundedBorder)
+                        .onChange(of: model.proxyKeyPath) { _ in
+                            model.saveProxySettings()
+                        }
+                    if let validation = model.proxyStartValidationMessage {
+                        Text(validation)
+                            .font(.caption2)
+                            .foregroundStyle(.red)
+                    }
                     HStack {
-                        Button("Start") { model.startProxy() }.buttonStyle(.bordered)
+                        Button("Start") { model.startProxy() }
+                            .buttonStyle(.bordered)
+                            .disabled(model.proxyStartValidationMessage != nil)
                         Button("Stop") { model.stopProxy() }.buttonStyle(.bordered)
                         Button("List Routes") { model.refreshRoutes() }.buttonStyle(.bordered)
                     }

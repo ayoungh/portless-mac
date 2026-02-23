@@ -29,6 +29,11 @@ Upstream Portless project: [vercel-labs/portless](https://github.com/vercel-labs
   - last observed log line (for managed processes)
 - Open detected URLs directly in your browser.
 - Stop managed or external processes from the UI.
+- Configure proxy startup from the UI:
+  - custom proxy port
+  - HTTPS mode
+  - disable TLS to backend
+  - custom TLS cert/key paths
 
 ## Run
 
