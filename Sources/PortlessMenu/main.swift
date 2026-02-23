@@ -468,9 +468,8 @@ final class PortlessMenuModel: ObservableObject {
         }
     }
 
-    func refreshPortlessProcessesNow() {
-        updateExternalProcesses()
-        scheduleRunningAppsRefresh()
+    func refreshPortlessProcessesNow(onComplete: (() -> Void)? = nil) {
+        refreshPortlessProcessesAsync(onComplete: onComplete)
     }
 
     func recentFolderLabel(for path: String) -> String {
@@ -545,13 +544,26 @@ final class PortlessMenuModel: ObservableObject {
     private func startMonitoring() {
         monitorTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.updateExternalProcesses()
-                self?.refreshRunningApps()
+                self?.refreshPortlessProcessesAsync()
             }
         }
 
-        updateExternalProcesses()
-        refreshRunningApps()
+        refreshPortlessProcessesAsync()
+    }
+
+    private func refreshPortlessProcessesAsync(onComplete: (() -> Void)? = nil) {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let snapshot = Self.captureOutputStatic(
+                executable: "/usr/bin/pgrep",
+                arguments: ["-fal", "portless"]
+            )
+            Task { @MainActor in
+                self.updateExternalProcesses(fromSnapshot: snapshot)
+                self.scheduleRunningAppsRefresh()
+                onComplete?()
+            }
+        }
     }
 
     private func refreshRunningApps() {
@@ -590,8 +602,7 @@ final class PortlessMenuModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: workItem)
     }
 
-    private func updateExternalProcesses() {
-        let snapshot = captureOutput(executable: "/usr/bin/pgrep", arguments: ["-fal", "portless"])
+    private func updateExternalProcesses(fromSnapshot snapshot: String) {
         guard !snapshot.isEmpty else {
             external = [:]
             return
@@ -911,6 +922,37 @@ final class PortlessMenuModel: ObservableObject {
                 return ""
             }
 
+            process.waitUntilExit()
+            return String(decoding: data, as: UTF8.self)
+        } catch {
+            return ""
+        }
+    }
+
+    nonisolated private static func captureOutputStatic(executable: String, arguments: [String]) -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        var data = Data()
+        let readComplete = DispatchSemaphore(value: 0)
+
+        DispatchQueue.global(qos: .utility).async {
+            data = pipe.fileHandleForReading.readDataToEndOfFile()
+            readComplete.signal()
+        }
+
+        do {
+            try process.run()
+            let waitResult = readComplete.wait(timeout: .now() + 2.0)
+            if waitResult == .timedOut {
+                process.terminate()
+                return ""
+            }
             process.waitUntilExit()
             return String(decoding: data, as: UTF8.self)
         } catch {
@@ -1487,8 +1529,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuWillOpen(_ menu: NSMenu) {
-        model.refreshPortlessProcessesNow()
         rebuildStatusMenu()
+        model.refreshPortlessProcessesNow { [weak self] in
+            self?.rebuildStatusMenu()
+        }
     }
 
     @objc private func openMainWindow() {
@@ -1512,8 +1556,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func refreshProcesses() {
-        model.refreshPortlessProcessesNow()
         rebuildStatusMenu()
+        model.refreshPortlessProcessesNow { [weak self] in
+            self?.rebuildStatusMenu()
+        }
     }
 
     @objc private func stopFromMenu(_ sender: NSMenuItem) {
