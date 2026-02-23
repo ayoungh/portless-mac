@@ -41,6 +41,16 @@ This repo follows a lightweight, repeatable release cycle for the macOS app bund
 7. Publish release:
    - `gh release create vX.Y.Z dist/PortlessMenu-vX.Y.Z-macos.zip --title "vX.Y.Z" --notes-file <notes-file>`
 
+## Automated Path
+
+Use the release script to execute the full flow:
+
+- `./scripts/release.sh X.Y.Z --generate-notes`
+- Optional:
+  - `--notes-file <path>`
+  - `--build-number <n>`
+  - `--dry-run`
+
 ## Notes Template
 
 - Summary: one paragraph about what changed.

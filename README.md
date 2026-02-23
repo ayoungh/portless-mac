@@ -136,6 +136,20 @@ Also remove it from `Login Items` if you added it there.
 
 If global install permissions are restricted on your machine, run one of those commands manually with appropriate permissions.
 
+### Create a release
+
+Use the one-command release script:
+
+```bash
+./scripts/release.sh 0.1.1 --generate-notes
+```
+
+Or provide custom notes:
+
+```bash
+./scripts/release.sh 0.1.1 --notes-file /path/to/release-notes.md
+```
+
 ### Troubleshooting
 
 - If the app does not appear in the menu bar, fully quit and relaunch `PortlessMenu`.
