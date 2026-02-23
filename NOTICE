@@ -1,0 +1,11 @@
+Portless Menu
+Copyright 2026 Portless Menu contributors
+
+This project is an independent macOS wrapper for the Portless CLI.
+
+Portless is a separate project by Vercel Labs:
+https://github.com/vercel-labs/portless
+
+Portless is licensed under the Apache License 2.0.
+This wrapper does not include or copy Portless source code; it invokes
+the Portless CLI installed on the user's machine.
