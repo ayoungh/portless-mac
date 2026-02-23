@@ -858,37 +858,63 @@ final class PortlessMenuModel: ObservableObject {
     }
 
     private func appendLogLine(pid: Int32, line: String) {
+        guard let cleanLine = sanitizedDisplayLine(line) else { return }
+
         var logs = managedLogLines[pid] ?? []
-        logs.append(line)
+        logs.append(cleanLine)
         if logs.count > 40 {
             logs.removeFirst(logs.count - 40)
         }
         managedLogLines[pid] = logs
         if var record = runRecordsByPID[pid] {
-            record.lastLogLine = line
+            record.lastLogLine = cleanLine
             runRecordsByPID[pid] = record
             scheduleRunHistoryRefresh()
         }
 
-        let urls = extractURLs(from: line)
+        let urls = extractURLs(from: cleanLine)
         if !urls.isEmpty {
             var knownURLs = managedURLs[pid] ?? []
             urls.forEach { knownURLs.insert($0) }
             managedURLs[pid] = knownURLs
 
             var knownPorts = managedPorts[pid] ?? []
-            let parsedPorts = extractPorts(from: line, urls: urls)
+            let parsedPorts = extractPorts(from: cleanLine, urls: urls)
             parsedPorts.forEach { knownPorts.insert($0) }
             managedPorts[pid] = knownPorts
             return
         }
 
-        let ports = extractPorts(from: line, urls: [])
+        let ports = extractPorts(from: cleanLine, urls: [])
         if !ports.isEmpty {
             var knownPorts = managedPorts[pid] ?? []
             ports.forEach { knownPorts.insert($0) }
             managedPorts[pid] = knownPorts
         }
+    }
+
+    private func sanitizedDisplayLine(_ raw: String) -> String? {
+        var cleaned = raw
+
+        // Strip common ANSI terminal escape sequences (CSI/OSC) and bare ESC.
+        if let csiRegex = try? NSRegularExpression(pattern: #"\u{001B}\[[0-?]*[ -/]*[@-~]"#) {
+            let range = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
+            cleaned = csiRegex.stringByReplacingMatches(in: cleaned, options: [], range: range, withTemplate: "")
+        }
+        if let oscRegex = try? NSRegularExpression(pattern: #"\u{001B}\][^\u{0007}\u{001B}]*(?:\u{0007}|\u{001B}\\)"#) {
+            let range = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
+            cleaned = oscRegex.stringByReplacingMatches(in: cleaned, options: [], range: range, withTemplate: "")
+        }
+        cleaned = cleaned.replacingOccurrences(of: "\u{001B}", with: "")
+
+        // Drop non-printable control characters while preserving tabs/spaces.
+        let filteredScalars = cleaned.unicodeScalars.filter { scalar in
+            scalar == "\t" || (scalar.value >= 0x20 && scalar.value != 0x7F)
+        }
+        cleaned = String(String.UnicodeScalarView(filteredScalars))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return cleaned.isEmpty ? nil : cleaned
     }
 
     private func extractURLs(from text: String) -> [String] {
@@ -1282,6 +1308,7 @@ final class PortlessMenuModel: ObservableObject {
         output
             .split(separator: "\n")
             .map(String.init)
+            .compactMap(sanitizedDisplayLine(_:))
             .last(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
     }
 
