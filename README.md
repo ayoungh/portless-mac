@@ -1,5 +1,8 @@
 # Portless Menu (macOS)
 
+![Portless menu screenshot](assets/menu-screenshot.png)
+![Portless app screenshot](assets/app-screenshot.png)
+
 Menu bar utility for running `package.json` scripts (with Portless scripts highlighted), naming runs, and monitoring active Portless processes.
 
 ## Project Scope
