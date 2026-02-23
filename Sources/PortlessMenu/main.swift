@@ -201,6 +201,34 @@ final class PortlessMenuModel: ObservableObject {
         hasLocalPortlessDependency || isPortlessInstalledGlobally || !selectedScriptNeedsPortlessTool
     }
 
+    var proxyCommandPreview: String {
+        buildProxyStartPlan().arguments.map(shellQuote).joined(separator: " ")
+    }
+
+    var proxyDiagnostics: [String] {
+        var messages: [String] = []
+
+        if !isPortlessInstalledGlobally && !hasLocalPortlessDependency {
+            messages.append("Portless CLI is not currently detected. Install Portless before using proxy controls.")
+        }
+
+        if proxyUseHTTPS &&
+            proxyCertPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+            proxyKeyPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            messages.append("HTTPS is enabled with managed certificates. If browsers warn, use Trust CA.")
+        }
+
+        if let port = Int(proxyPort.trimmingCharacters(in: .whitespacesAndNewlines)), port < 1024 {
+            messages.append("Port \(port) may require elevated privileges on macOS.")
+        }
+
+        if proxyNoTLS && !proxyUseHTTPS {
+            messages.append("--no-tls is enabled while HTTPS is off. Confirm this backend mode is intentional.")
+        }
+
+        return messages
+    }
+
     var proxyStartValidationMessage: String? {
         let cert = proxyCertPath.trimmingCharacters(in: .whitespacesAndNewlines)
         let key = proxyKeyPath.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -548,6 +576,13 @@ final class PortlessMenuModel: ObservableObject {
         }
         NSWorkspace.shared.open(url)
         statusMessage = "Opened \(rawURL)"
+    }
+
+    func copyToClipboard(_ value: String, label: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(value, forType: .string)
+        statusMessage = "Copied \(label) to clipboard."
     }
 
     func refreshPortlessAvailability() {
@@ -1316,30 +1351,76 @@ final class PortlessMenuModel: ObservableObject {
 
     private func parseProxyRoutes(from lines: [String]) -> [ProxyRoute] {
         var parsed: [ProxyRoute] = []
+        let splitter = try? NSRegularExpression(pattern: #"\s{2,}"#)
 
         for (index, line) in lines.enumerated() {
-            let lower = line.lowercased()
-            if lower == "routes" || lower.hasPrefix("name ") || lower.hasPrefix("app ") {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
                 continue
             }
 
-            let urls = extractURLs(from: line)
+            let lower = trimmed.lowercased()
+            if lower == "routes" ||
+                lower.hasPrefix("name ") ||
+                lower.hasPrefix("app ") ||
+                lower.hasPrefix("route ") ||
+                lower.hasPrefix("proxy ") ||
+                lower.contains("active routes") {
+                continue
+            }
+            if trimmed.allSatisfy({ $0 == "-" || $0 == "=" || $0 == "|" || $0.isWhitespace }) {
+                continue
+            }
+
+            let urls = extractURLs(from: trimmed)
             let primaryURL = urls.first
             let components = primaryURL.flatMap(URLComponents.init(string:))
-            let ports = extractPorts(from: line, urls: urls)
+            let ports = extractPorts(from: trimmed, urls: urls)
+
+            let columns: [String]
+            if let splitter {
+                let nsRange = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+                let matches = splitter.matches(in: trimmed, options: [], range: nsRange)
+                if !matches.isEmpty {
+                    var parts: [String] = []
+                    var cursor = trimmed.startIndex
+                    for match in matches {
+                        guard let range = Range(match.range, in: trimmed) else { continue }
+                        let piece = String(trimmed[cursor..<range.lowerBound]).trimmingCharacters(in: .whitespaces)
+                        if !piece.isEmpty { parts.append(piece) }
+                        cursor = range.upperBound
+                    }
+                    let tail = String(trimmed[cursor...]).trimmingCharacters(in: .whitespaces)
+                    if !tail.isEmpty { parts.append(tail) }
+                    columns = parts
+                } else {
+                    columns = []
+                }
+            } else {
+                columns = []
+            }
 
             let name: String
-            if let arrowRange = line.range(of: "->") {
-                name = String(line[..<arrowRange.lowerBound]).trimmingCharacters(in: .whitespaces)
+            if let arrowRange = trimmed.range(of: "->") {
+                name = String(trimmed[..<arrowRange.lowerBound]).trimmingCharacters(in: .whitespaces)
+            } else if let firstColumn = columns.first {
+                name = firstColumn
             } else {
-                name = line.split(separator: " ").first.map(String.init) ?? "route-\(index + 1)"
+                name = trimmed.split(separator: " ").first.map(String.init) ?? "route-\(index + 1)"
+            }
+
+            let fallbackURL: String?
+            if primaryURL != nil {
+                fallbackURL = primaryURL
+            } else {
+                fallbackURL = columns.first(where: { $0.contains("://") })
             }
 
             let route = ProxyRoute(
-                id: "route-\(index)-\(line.hashValue)",
-                rawLine: line,
+                id: "route-\(index)-\(trimmed.hashValue)",
+                rawLine: trimmed,
                 name: name.isEmpty ? "route-\(index + 1)" : name,
-                url: primaryURL,
+                url: fallbackURL,
                 scheme: components?.scheme,
                 host: components?.host,
                 port: components?.port ?? ports.first
@@ -1543,6 +1624,27 @@ struct ContentView: View {
                         Button("Trust CA") { model.trustProxyCertificate() }.buttonStyle(.bordered)
                         Button("List Routes") { model.refreshRoutes() }.buttonStyle(.bordered)
                     }
+                    HStack(spacing: 6) {
+                        Text(model.proxyCommandPreview)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .textSelection(.enabled)
+                        Spacer()
+                        Button("Copy Command") {
+                            model.copyToClipboard(model.proxyCommandPreview, label: "proxy command")
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    if !model.proxyDiagnostics.isEmpty {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(model.proxyDiagnostics, id: \.self) { diagnostic in
+                                Text("• \(diagnostic)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
                     if model.proxyRoutes.isEmpty {
                         Text("No active routes.")
                             .font(.caption)
@@ -1562,6 +1664,10 @@ struct ContentView: View {
                                     Spacer()
                                     if let url = route.url {
                                         Button("Open") { model.openInBrowser(url) }
+                                            .buttonStyle(.bordered)
+                                        Button("Copy URL") {
+                                            model.copyToClipboard(url, label: "route URL")
+                                        }
                                             .buttonStyle(.bordered)
                                     }
                                 }
@@ -1601,6 +1707,10 @@ struct ContentView: View {
                                                     Spacer()
                                                     Button("Open") { model.openInBrowser(appURL) }
                                                         .buttonStyle(.bordered)
+                                                    Button("Copy") {
+                                                        model.copyToClipboard(appURL, label: "app URL")
+                                                    }
+                                                    .buttonStyle(.bordered)
                                                 }
                                             }
                                         }

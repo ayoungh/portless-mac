@@ -37,6 +37,8 @@ Upstream Portless project: [vercel-labs/portless](https://github.com/vercel-labs
 - Restart proxy and trust local CA from the UI (`portless trust` via admin prompt).
 - Show parsed routes with quick-open actions.
 - Show all detected app URLs (not just the first URL).
+- Show proxy diagnostics for common misconfigurations.
+- Copy proxy start command and detected URLs from the UI.
 
 ## Run
 
