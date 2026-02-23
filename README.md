@@ -34,6 +34,9 @@ Upstream Portless project: [vercel-labs/portless](https://github.com/vercel-labs
   - HTTPS mode
   - disable TLS to backend
   - custom TLS cert/key paths
+- Restart proxy and trust local CA from the UI (`portless trust` via admin prompt).
+- Show parsed routes with quick-open actions.
+- Show all detected app URLs (not just the first URL).
 
 ## Run
 

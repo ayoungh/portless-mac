@@ -71,6 +71,28 @@ struct ScriptRunnerPlan {
     let warning: String?
 }
 
+struct ProxyRoute: Identifiable, Hashable {
+    let id: String
+    let rawLine: String
+    let name: String
+    let url: String?
+    let scheme: String?
+    let host: String?
+    let port: Int?
+
+    var endpoint: String {
+        if let url, !url.isEmpty {
+            return url
+        }
+        guard let host else { return rawLine }
+        let resolvedScheme = scheme ?? "http"
+        if let port {
+            return "\(resolvedScheme)://\(host):\(port)"
+        }
+        return "\(resolvedScheme)://\(host)"
+    }
+}
+
 final class ManagedProcess {
     let process: Process
     let app: RunningApp
@@ -94,6 +116,7 @@ final class PortlessMenuModel: ObservableObject {
     @Published var recentRuns: [RunRecord] = []
     @Published var recentLaunches: [RecentLaunch] = []
     @Published var routes: [String] = []
+    @Published var proxyRoutes: [ProxyRoute] = []
     @Published var proxyPort: String = ""
     @Published var proxyUseHTTPS: Bool = false
     @Published var proxyNoTLS: Bool = false
@@ -570,9 +593,44 @@ final class PortlessMenuModel: ObservableObject {
         }
     }
 
+    func restartProxy() {
+        guard canRunSelectedPortlessScript || isPortlessInstalledGlobally else {
+            statusMessage = "Install Portless before restarting proxy."
+            return
+        }
+        if let validation = proxyStartValidationMessage {
+            statusMessage = validation
+            return
+        }
+
+        statusMessage = "Restarting Portless proxy..."
+        runAsyncCommand(["portless", "proxy", "stop"]) { [weak self] _, _ in
+            self?.startProxy()
+        }
+    }
+
+    func trustProxyCertificate() {
+        guard commandExists("portless") else {
+            statusMessage = "Install Portless before trusting certificates."
+            return
+        }
+
+        statusMessage = "Requesting admin access to trust Portless certificate..."
+        runAsyncAdminShell("portless trust") { [weak self] code, output in
+            guard let self else { return }
+            if code == 0 {
+                self.statusMessage = "Portless certificate trusted."
+            } else {
+                let summary = self.lastNonEmptyLine(from: output) ?? "authorization failed"
+                self.statusMessage = "Trust failed: \(summary)"
+            }
+        }
+    }
+
     func refreshRoutes() {
         guard commandExists("portless") else {
             routes = []
+            proxyRoutes = []
             return
         }
 
@@ -580,6 +638,7 @@ final class PortlessMenuModel: ObservableObject {
             guard let self else { return }
             if code != 0 {
                 self.routes = []
+                self.proxyRoutes = []
                 return
             }
 
@@ -588,6 +647,7 @@ final class PortlessMenuModel: ObservableObject {
                 .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
             self.routes = lines
+            self.proxyRoutes = self.parseProxyRoutes(from: lines)
         }
     }
 
@@ -1000,6 +1060,37 @@ final class PortlessMenuModel: ObservableObject {
         }
     }
 
+    private func runAsyncAdminShell(_ command: String, completion: @escaping (Int32, String) -> Void) {
+        let environment = toolExecutionEnvironment()
+        let pathValue = environment["PATH"] ?? ""
+        let shellCommand = "export PATH=\(shellQuote(pathValue)); \(command)"
+        let script = "do shell script \(appleScriptString(shellCommand)) with administrator privileges"
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            process.arguments = ["-e", script]
+
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+
+            do {
+                try process.run()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                let output = String(decoding: data, as: UTF8.self)
+                DispatchQueue.main.async {
+                    completion(process.terminationStatus, output)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    completion(1, error.localizedDescription)
+                }
+            }
+        }
+    }
+
     private func captureOutput(executable: String, arguments: [String], useToolEnvironment: Bool = true) -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
@@ -1216,6 +1307,49 @@ final class PortlessMenuModel: ObservableObject {
         "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 
+    private func appleScriptString(_ value: String) -> String {
+        let escaped = value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
+    }
+
+    private func parseProxyRoutes(from lines: [String]) -> [ProxyRoute] {
+        var parsed: [ProxyRoute] = []
+
+        for (index, line) in lines.enumerated() {
+            let lower = line.lowercased()
+            if lower == "routes" || lower.hasPrefix("name ") || lower.hasPrefix("app ") {
+                continue
+            }
+
+            let urls = extractURLs(from: line)
+            let primaryURL = urls.first
+            let components = primaryURL.flatMap(URLComponents.init(string:))
+            let ports = extractPorts(from: line, urls: urls)
+
+            let name: String
+            if let arrowRange = line.range(of: "->") {
+                name = String(line[..<arrowRange.lowerBound]).trimmingCharacters(in: .whitespaces)
+            } else {
+                name = line.split(separator: " ").first.map(String.init) ?? "route-\(index + 1)"
+            }
+
+            let route = ProxyRoute(
+                id: "route-\(index)-\(line.hashValue)",
+                rawLine: line,
+                name: name.isEmpty ? "route-\(index + 1)" : name,
+                url: primaryURL,
+                scheme: components?.scheme,
+                host: components?.host,
+                port: components?.port ?? ports.first
+            )
+            parsed.append(route)
+        }
+
+        return parsed
+    }
+
     private func loadRecentFolders() {
         let saved = UserDefaults.standard.array(forKey: recentFoldersKey) as? [String] ?? []
         recentFolders = saved.filter { FileManager.default.fileExists(atPath: $0) }
@@ -1403,19 +1537,34 @@ struct ContentView: View {
                             .buttonStyle(.bordered)
                             .disabled(model.proxyStartValidationMessage != nil)
                         Button("Stop") { model.stopProxy() }.buttonStyle(.bordered)
+                        Button("Restart") { model.restartProxy() }
+                            .buttonStyle(.bordered)
+                            .disabled(model.proxyStartValidationMessage != nil)
+                        Button("Trust CA") { model.trustProxyCertificate() }.buttonStyle(.bordered)
                         Button("List Routes") { model.refreshRoutes() }.buttonStyle(.bordered)
                     }
-                    if model.routes.isEmpty {
+                    if model.proxyRoutes.isEmpty {
                         Text("No active routes.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     } else {
-                        VStack(alignment: .leading, spacing: 3) {
-                            ForEach(model.routes, id: \.self) { route in
-                                Text(route)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .textSelection(.enabled)
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(model.proxyRoutes) { route in
+                                HStack(spacing: 6) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(route.name)
+                                            .font(.caption)
+                                        Text(route.endpoint)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .textSelection(.enabled)
+                                    }
+                                    Spacer()
+                                    if let url = route.url {
+                                        Button("Open") { model.openInBrowser(url) }
+                                            .buttonStyle(.bordered)
+                                    }
+                                }
                             }
                         }
                     }
@@ -1423,7 +1572,7 @@ struct ContentView: View {
 
                 sectionCard("Running Apps", badge: "\(model.runningApps.count)") {
                     if model.runningApps.isEmpty {
-                        Text(model.routes.isEmpty ? "No running apps." : "Routes active, but no tracked wrapper process.")
+                        Text(model.proxyRoutes.isEmpty ? "No running apps." : "Routes active, but no tracked wrapper process.")
                             .foregroundStyle(.secondary)
                     } else {
                         VStack(alignment: .leading, spacing: 8) {
@@ -1442,14 +1591,18 @@ struct ContentView: View {
                                         .buttonStyle(.bordered)
                                     }
                                     if !app.urls.isEmpty {
-                                        HStack(spacing: 6) {
-                                            Text(app.urls[0])
-                                                .font(.caption2)
-                                                .foregroundStyle(.secondary)
-                                                .lineLimit(1)
-                                            Spacer()
-                                            Button("Open") { model.openInBrowser(app.urls[0]) }
-                                                .buttonStyle(.bordered)
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            ForEach(app.urls, id: \.self) { appURL in
+                                                HStack(spacing: 6) {
+                                                    Text(appURL)
+                                                        .font(.caption2)
+                                                        .foregroundStyle(.secondary)
+                                                        .lineLimit(1)
+                                                    Spacer()
+                                                    Button("Open") { model.openInBrowser(appURL) }
+                                                        .buttonStyle(.bordered)
+                                                }
+                                            }
                                         }
                                     } else if let logLine = app.lastLogLine {
                                         Text(logLine)
