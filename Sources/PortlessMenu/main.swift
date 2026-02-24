@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ServiceManagement
 
 struct PackageJSON: Decodable {
     let scripts: [String: String]?
@@ -32,6 +33,7 @@ struct RunningApp: Identifiable, Hashable {
     let scriptKey: String
     let folderPath: String
     let command: String
+    let commandParts: [String]
     let source: Source
     let startedAt: Date
     let ports: [Int]
@@ -58,6 +60,15 @@ struct RunRecord: Identifiable, Hashable {
 }
 
 struct RecentLaunch: Identifiable, Hashable, Codable {
+    let id: String
+    let name: String
+    let scriptKey: String
+    let folderPath: String
+    let commandParts: [String]
+    let createdAt: Date
+}
+
+struct RestorableLaunch: Identifiable, Hashable, Codable {
     let id: String
     let name: String
     let scriptKey: String
@@ -122,6 +133,8 @@ final class PortlessMenuModel: ObservableObject {
     @Published var proxyNoTLS: Bool = false
     @Published var proxyCertPath: String = ""
     @Published var proxyKeyPath: String = ""
+    @Published var launchAtLoginEnabled: Bool = false
+    @Published var restoreManagedAppsOnLaunch: Bool = false
     @Published var hasLocalPortlessDependency: Bool = false
     @Published var isPortlessInstalledGlobally: Bool = false
     @Published var isInstallingPortless: Bool = false
@@ -134,6 +147,9 @@ final class PortlessMenuModel: ObservableObject {
     private let proxyNoTLSKey = "portlessMenu.proxyNoTLS"
     private let proxyCertPathKey = "portlessMenu.proxyCertPath"
     private let proxyKeyPathKey = "portlessMenu.proxyKeyPath"
+    private let launchAtLoginKey = "portlessMenu.launchAtLoginEnabled"
+    private let restoreManagedAppsOnLaunchKey = "portlessMenu.restoreManagedAppsOnLaunch"
+    private let restorableLaunchesKey = "portlessMenu.restorableLaunches"
     private let maxRecentFolders = 8
 
     private var managed: [Int32: ManagedProcess] = [:]
@@ -150,8 +166,12 @@ final class PortlessMenuModel: ObservableObject {
     private var commandExistsCache: [String: (exists: Bool, at: Date)] = [:]
     private var runningAppsRefreshWorkItem: DispatchWorkItem?
     private var runHistoryRefreshWorkItem: DispatchWorkItem?
+    private var restorableLaunches: [RestorableLaunch] = []
+    private var hasAttemptedStartupRestore = false
+    private var isApplyingLaunchAtLoginSetting = false
     private let maxRunHistory = 20
     private let maxRecentLaunches = 12
+    private let maxRestorableLaunches = 8
     private let toolCacheTTL: TimeInterval = 30
     private let knownPortlessPackages = ["portless", "@vercel-labs/portless"]
     private let preferredBinPaths = [
@@ -166,7 +186,10 @@ final class PortlessMenuModel: ObservableObject {
         loadRecentFolders()
         loadRecentLaunches()
         loadProxySettings()
+        loadStartupSettings()
+        loadRestorableLaunches()
         DispatchQueue.main.async { [weak self] in
+            self?.syncLaunchAtLoginStateFromSystem()
             self?.refreshPortlessAvailability()
             self?.startMonitoring()
             self?.refreshRoutes()
@@ -421,6 +444,7 @@ final class PortlessMenuModel: ObservableObject {
             scriptKey: scriptKey,
             folderPath: folder,
             command: commandParts.joined(separator: " "),
+            commandParts: commandParts,
             source: .managed,
             startedAt: Date(),
             ports: [],
@@ -433,6 +457,7 @@ final class PortlessMenuModel: ObservableObject {
         managedLogLines[pid] = []
         managedURLs[pid] = []
         managedPorts[pid] = []
+        refreshRestorableLaunches()
 
         let record = RunRecord(
             id: "run-\(pid)-\(Int(Date().timeIntervalSince1970))",
@@ -723,6 +748,7 @@ final class PortlessMenuModel: ObservableObject {
                 scriptKey: base.scriptKey,
                 folderPath: base.folderPath,
                 command: base.command,
+                commandParts: base.commandParts,
                 source: base.source,
                 startedAt: base.startedAt,
                 ports: Array(managedPorts[pid] ?? []).sorted(),
@@ -778,6 +804,7 @@ final class PortlessMenuModel: ObservableObject {
                 scriptKey: "external",
                 folderPath: inferWorkingDirectory(from: command) ?? "unknown",
                 command: command,
+                commandParts: command.split(separator: " ").map(String.init),
                 source: .external,
                 startedAt: startDate,
                 ports: ports,
@@ -796,6 +823,7 @@ final class PortlessMenuModel: ObservableObject {
         managedLogLines.removeValue(forKey: pid)
         managedURLs.removeValue(forKey: pid)
         managedPorts.removeValue(forKey: pid)
+        refreshRestorableLaunches()
     }
 
     private func updateRunRecordForTermination(pid: Int32, exitCode: Int32, lastLine: String?) {
@@ -1500,6 +1528,24 @@ final class PortlessMenuModel: ObservableObject {
         proxyKeyPath = defaults.string(forKey: proxyKeyPathKey) ?? ""
     }
 
+    private func loadStartupSettings() {
+        let defaults = UserDefaults.standard
+        launchAtLoginEnabled = defaults.bool(forKey: launchAtLoginKey)
+        restoreManagedAppsOnLaunch = defaults.bool(forKey: restoreManagedAppsOnLaunchKey)
+    }
+
+    private func loadRestorableLaunches() {
+        guard let data = UserDefaults.standard.data(forKey: restorableLaunchesKey) else {
+            restorableLaunches = []
+            return
+        }
+        if let decoded = try? JSONDecoder().decode([RestorableLaunch].self, from: data) {
+            restorableLaunches = decoded.filter { FileManager.default.fileExists(atPath: $0.folderPath) }
+        } else {
+            restorableLaunches = []
+        }
+    }
+
     func saveProxySettings() {
         let defaults = UserDefaults.standard
         defaults.set(proxyPort.trimmingCharacters(in: .whitespacesAndNewlines), forKey: proxyPortKey)
@@ -1507,6 +1553,90 @@ final class PortlessMenuModel: ObservableObject {
         defaults.set(proxyNoTLS, forKey: proxyNoTLSKey)
         defaults.set(proxyCertPath.trimmingCharacters(in: .whitespacesAndNewlines), forKey: proxyCertPathKey)
         defaults.set(proxyKeyPath.trimmingCharacters(in: .whitespacesAndNewlines), forKey: proxyKeyPathKey)
+    }
+
+    func setRestoreManagedAppsOnLaunch(_ enabled: Bool) {
+        restoreManagedAppsOnLaunch = enabled
+        UserDefaults.standard.set(enabled, forKey: restoreManagedAppsOnLaunchKey)
+    }
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        guard !isApplyingLaunchAtLoginSetting else { return }
+        isApplyingLaunchAtLoginSetting = true
+        defer { isApplyingLaunchAtLoginSetting = false }
+
+        do {
+            if enabled {
+                if SMAppService.mainApp.status != .enabled {
+                    try SMAppService.mainApp.register()
+                }
+                launchAtLoginEnabled = true
+                UserDefaults.standard.set(true, forKey: launchAtLoginKey)
+                statusMessage = "PortlessMenu will launch at login."
+            } else {
+                if SMAppService.mainApp.status == .enabled {
+                    try SMAppService.mainApp.unregister()
+                }
+                launchAtLoginEnabled = false
+                UserDefaults.standard.set(false, forKey: launchAtLoginKey)
+                statusMessage = "PortlessMenu will no longer launch at login."
+            }
+        } catch {
+            syncLaunchAtLoginStateFromSystem()
+            statusMessage = "Failed to update login-item setting: \(error.localizedDescription)"
+        }
+    }
+
+    func syncLaunchAtLoginStateFromSystem() {
+        let isEnabled = SMAppService.mainApp.status == .enabled
+        launchAtLoginEnabled = isEnabled
+        UserDefaults.standard.set(isEnabled, forKey: launchAtLoginKey)
+    }
+
+    func restoreManagedLaunchesIfNeeded() {
+        guard restoreManagedAppsOnLaunch else { return }
+        guard !hasAttemptedStartupRestore else { return }
+        hasAttemptedStartupRestore = true
+
+        var candidates = restorableLaunches
+            .filter { FileManager.default.fileExists(atPath: $0.folderPath) }
+
+        if candidates.isEmpty {
+            return
+        }
+
+        let currentlyRunning = Set(
+            runningApps.map { launchSignature(folderPath: $0.folderPath, commandParts: $0.commandParts) }
+        )
+        candidates.removeAll { currentlyRunning.contains(launchSignature(folderPath: $0.folderPath, commandParts: $0.commandParts)) }
+
+        if candidates.isEmpty {
+            statusMessage = "Startup restore skipped: matching apps already running."
+            return
+        }
+
+        var started = 0
+        for (index, launch) in candidates.enumerated() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + (Double(index) * 0.4)) { [weak self] in
+                guard let self else { return }
+                guard FileManager.default.fileExists(atPath: launch.folderPath) else { return }
+                self.startManagedProcess(
+                    commandParts: launch.commandParts,
+                    folder: launch.folderPath,
+                    displayName: launch.name,
+                    scriptKey: launch.scriptKey,
+                    warning: nil,
+                    storeRecent: false
+                )
+            }
+            started += 1
+        }
+
+        statusMessage = "Restoring \(started) app\(started == 1 ? "" : "s") from previous session..."
+    }
+
+    func persistManagedLaunchesSnapshot() {
+        refreshRestorableLaunches()
     }
 
     private func addRecentFolder(_ path: String) {
@@ -1549,6 +1679,45 @@ final class PortlessMenuModel: ObservableObject {
             UserDefaults.standard.set(data, forKey: recentLaunchesKey)
         }
     }
+
+    private func refreshRestorableLaunches() {
+        var next: [RestorableLaunch] = []
+        var seen = Set<String>()
+
+        let managedApps = managed.values
+            .map(\.app)
+            .sorted { $0.startedAt > $1.startedAt }
+
+        for app in managedApps {
+            guard FileManager.default.fileExists(atPath: app.folderPath) else { continue }
+            let signature = launchSignature(folderPath: app.folderPath, commandParts: app.commandParts)
+            guard !seen.contains(signature) else { continue }
+            seen.insert(signature)
+            next.append(
+                RestorableLaunch(
+                    id: UUID().uuidString,
+                    name: app.name,
+                    scriptKey: app.scriptKey,
+                    folderPath: app.folderPath,
+                    commandParts: app.commandParts,
+                    createdAt: Date()
+                )
+            )
+            if next.count >= maxRestorableLaunches {
+                break
+            }
+        }
+
+        restorableLaunches = next
+        if let data = try? JSONEncoder().encode(next) {
+            UserDefaults.standard.set(data, forKey: restorableLaunchesKey)
+        }
+    }
+
+    private func launchSignature(folderPath: String, commandParts: [String]) -> String {
+        let normalizedFolder = URL(fileURLWithPath: folderPath).path
+        return "\(normalizedFolder)|\(commandParts.joined(separator: "\u{001F}"))"
+    }
 }
 
 struct ContentView: View {
@@ -1583,6 +1752,17 @@ struct ContentView: View {
                             }
                         }
                     }
+                }
+
+                sectionCard("Startup") {
+                    Toggle("Launch PortlessMenu at login", isOn: $model.launchAtLoginEnabled)
+                        .onChange(of: model.launchAtLoginEnabled) { enabled in
+                            model.setLaunchAtLogin(enabled)
+                        }
+                    Toggle("Restore previous running apps on launch", isOn: $model.restoreManagedAppsOnLaunch)
+                        .onChange(of: model.restoreManagedAppsOnLaunch) { enabled in
+                            model.setRestoreManagedAppsOnLaunch(enabled)
+                        }
                 }
 
                 sectionCard("Scripts") {
@@ -1878,8 +2058,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
             self?.openMainWindow()
         }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+            self?.model.refreshPortlessProcessesNow { [weak self] in
+                self?.model.restoreManagedLaunchesIfNeeded()
+                self?.rebuildStatusMenu()
+            }
+        }
         NSApp.activate(ignoringOtherApps: true)
         log("app activated")
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        model.persistManagedLaunchesSnapshot()
     }
 
     private func setupStatusItem() {
